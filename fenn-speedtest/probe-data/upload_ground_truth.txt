@@ -1,4 +1,0 @@
-upload ground truth: 6 parallel POSTs of 25 MB to speed.cloudflare.com/__up
-total: 157286400 bytes (157 MB), wall 1.26s
-aggregate (sum of per-stream rates): 139.14 MB/s = 1113 Mbps
-per-stream: 169, 178, 213, 193, 194, 166 Mbps

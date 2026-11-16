@@ -1,9 +1,0 @@
-id          = "speedtest"
-name        = "Speedtest"
-icon        = "speedometer"
-size        = "wide"
-run         = ["bin/speedtest.exe"]
-mode        = "live"
-page_size   = [536, 320]
-description = "Download, upload and ping test from the notch."
-version     = "0.3.0"

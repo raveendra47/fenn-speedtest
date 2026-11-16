@@ -14,6 +14,7 @@ Usage:
 import json
 import os
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -114,6 +115,26 @@ def tile_kind(view):
     if any(c.get("type") == "text" and c.get("size") == "title" for c in kids):
         return "small"
     return "large"
+
+
+def find_all(view, t):
+    """Every node of type t anywhere in a view tree."""
+    found = []
+    if isinstance(view, dict):
+        if view.get("type") == t:
+            found.append(view)
+        for c in view.get("children", []):
+            found.extend(find_all(c, t))
+    return found
+
+
+def find_all_texts(view):
+    return [n.get("text") for n in find_all(view, "text")]
+
+
+def has_live_down(view):
+    """A '↓' line that already carries its number (live view during upload)."""
+    return any(isinstance(t, str) and re.search(r"↓\s*\d", t) for t in find_all_texts(view))
 
 
 # ---------------------------------------------------------------- mock server
@@ -223,8 +244,9 @@ def t_protocol_and_layout(tmp):
     layout(p, "large", 104, 104)
     tile = p.wait_for(lambda m: m.get("type") == "tile" and tile_kind(m["view"]) == "large",
                       "large tile")
-    kids = tile["view"].get("children", [])
-    check(kids and kids[0].get("text") == "Speedtest", "2x2 tile has its title")
+    check("Speedtest" in find_all_texts(tile["view"]), "2x2 tile has its title")
+    check(any(b.get("id") == "run" for b in find_all(tile["view"], "button")),
+          "2x2 tile carries a run button")
 
     # an unknown message type must be ignored, not fatal (protocol v1 rule)
     p.send({"type": "something-new", "stuff": 1})
@@ -291,6 +313,66 @@ def t_success(tmp):
     p.send({"type": "event", "id": "run", "kind": "click"})  # a second run must also work
     time.sleep(1.5)
     check(p.proc.poll() is None, "plugin still alive after a second run started")
+    check(p.shutdown() == 0, "shutdown exits cleanly")
+    check(not p.bad_lines, "every stdout line was JSON")
+    srv.shutdown()
+
+
+def looks_like_error(t):
+    """Page text that is not a label, a dash, a live placeholder or a number."""
+    return (t and t not in ("–", "…", "Download history", "Run test", "Testing…")
+            and "Mbps" not in t and "ms" not in t
+            and not t.replace(".", "").replace("-", "").isdigit())
+
+
+def t_tile_run(tmp):
+    print("a real run from the tile: ▶ button, tile_click, live numbers")
+    reset_mock()
+    srv = mock_server()
+    p = Plugin(tmp, env={"SPEEDTEST_BASE_URL": f"http://127.0.0.1:{srv.server_address[1]}",
+                         "SPEEDTEST_SECS": "0.6", "SPEEDTEST_WARMUP_SECS": "0.3"})
+    hello(p, tmp)
+    page = p.wait_for(lambda m: m.get("type") == "page", "page")
+    check(any(a.get("id") == "run" for a in page.get("actions", [])),
+          "page header has a run action")
+
+    layout(p, "large", 104, 104)
+    p.wait_for(lambda m: m.get("type") == "tile" and tile_kind(m["view"]) == "large",
+               "large tile")
+
+    p.send({"type": "event", "id": "run", "kind": "click"})  # the tile's ▶
+    p.wait_for(lambda m: m.get("type") == "active" and m.get("active") is True, "active on")
+    badges, saw_live, done = set(), False, False
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline and not done:
+        m = p.next_msg(5)
+        if m.get("type") == "badge" and isinstance(m.get("badge"), dict):
+            badges.add(m["badge"].get("label"))
+        if m.get("type") == "tile" and has_live_down(m["view"]):
+            saw_live = True
+        if m.get("type") == "active" and m.get("active") is False:
+            done = True
+    check(done, "run from the tile button finished")
+    check(badges == {"P", "D", "U"}, f"phases ran (got {badges})")
+    check(saw_live, "the 2x2 tile showed the download number while uploading")
+    check(len(json.load(open(os.path.join(tmp, "history.json")))) == 1, "history has the run")
+
+    # a tap on the tile body (tile_click) starts the next run; the wide tile
+    # fills in the download number live during the upload phase
+    layout(p, "wide", 104, 36)
+    p.wait_for(lambda m: m.get("type") == "tile" and tile_kind(m["view"]) == "wide", "wide tile")
+    p.send({"type": "tile_click"})
+    p.wait_for(lambda m: m.get("type") == "active" and m.get("active") is True, "active on (2)")
+    saw_live, done = False, False
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline and not done:
+        m = p.next_msg(5)
+        if m.get("type") == "tile" and has_live_down(m["view"]):
+            saw_live = True
+        if m.get("type") == "active" and m.get("active") is False:
+            done = True
+    check(done and saw_live, "tile_click ran a test; the wide tile filled in live")
+    check(len(json.load(open(os.path.join(tmp, "history.json")))) == 2, "history has both runs")
     check(p.shutdown() == 0, "shutdown exits cleanly")
     check(not p.bad_lines, "every stdout line was JSON")
     srv.shutdown()
@@ -389,9 +471,7 @@ def t_unreachable(tmp):
         if m.get("type") == "page":
             texts = [c.get("text", "") for c in m["view"].get("children", [])
                      if c.get("type") == "text"]
-            err = next((t for t in texts if t and t not in
-                        ("–", "Download history", "Run test", "Testing…")
-                        and "Mbps" not in t and "ms" not in t), err)
+            err = next((t for t in texts if looks_like_error(t)), err)
             btn = next((c for c in m["view"].get("children", []) if c.get("id") == "run"), None)
             if err and btn and btn.get("label") == "Run test":
                 break
@@ -448,6 +528,7 @@ def main():
     tests = [
         t_protocol_and_layout,
         t_success,
+        t_tile_run,
         t_rate_limited,
         t_size_fallback,
         t_byte_cap,

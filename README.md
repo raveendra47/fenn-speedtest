@@ -1,8 +1,9 @@
 # Speedtest for Fenn
 
-Download, upload and ping test, right from the notch. Click the tile to open the page and press **Run test**.
+Download, upload and ping test, right from the notch. Tap the tile — or press **▶** on the 2×2 tile, or **Run test** on the page — and a real test runs, its numbers filling in live in every view as each phase finishes. Tapping the tile also opens the page, which shows the same live numbers.
 
-- Tile sizes: 1×1 (download speed), 2×1 (download and upload), 2×2 (download, upload, ping and history).
+- Tile sizes: 1×1 (download speed), 2×1 (download and upload), 2×2 (download, upload, ping, history and a ▶ button).
+- Starts from anywhere: a tap on the tile, the ▶ on the 2×2 tile (runs without opening the page), Run test or the header ▶ on the page. While a test runs, ping, download and upload appear the moment their phases finish.
 - Keeps your last 20 results and draws them as a graph.
 
 ## What you need
@@ -34,7 +35,7 @@ The method matches the engine behind [speed.cloudflare.com](https://speed.cloudf
 
 ## Development
 
-`tests/fake_fenn.py` is a fake Fenn plus a mock speed-test server. It checks the protocol (tile at all three sizes, layout persistence across restarts), a full run, a 429 abort, the size-probe fallback and an unreachable server — all without touching the network:
+`tests/fake_fenn.py` is a fake Fenn plus a mock speed-test server. It checks the protocol (tile at all three sizes, layout persistence across restarts), a full run, a run started from the tile (its ▶ button and a tap on the tile body, with the live numbers on the tile), a 429 abort, the size-probe fallback and an unreachable server — all without touching the network:
 
 ```
 cargo build --release

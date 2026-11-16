@@ -1,8 +1,0 @@
-== state while limited (all 2s apart) ==
-GET bytes=0 plain                      -> 200 0.066468
-HEAD bytes=25000000 plain              -> 200 0.052633
-GET bytes=0 + Origin                   -> 200 0.050370
-GET bytes=0 + Referer                  -> 200 0.045596
-POST 1000B plain                       -> 200 0.036580
-HEAD 100MB + Origin                    -> 200 0.065924
-DONE

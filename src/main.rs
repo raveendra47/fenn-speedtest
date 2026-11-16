@@ -1,5 +1,7 @@
 // Speedtest for Fenn: download, upload and ping against speed.cloudflare.com,
-// drawn on a tile and a page. See README.md for what it sends and saves.
+// drawn on a tile and a page. A tap on the tile, the ▶ on the 2x2 tile or
+// Run test on the page starts a real test; the numbers fill in live in every
+// view as each phase finishes. See README.md for what it sends and saves.
 //
 // Measurement design:
 // - ping: one warm-up request, then five timed empty requests; the median
@@ -106,7 +108,9 @@ struct Run {
 
 enum Msg {
     Fenn(Value),
-    Phase(&'static str, f64),
+    /// Phase label, ring progress, and the results finished so far (ping,
+    /// download), so every view can fill its numbers in live.
+    Phase(&'static str, f64, Option<f64>, Option<f64>),
     Done(Result<Run, String>),
 }
 
@@ -143,6 +147,9 @@ impl TileSize {
 struct State {
     hist: Vec<Run>,
     phase: Option<&'static str>,
+    /// Results of the running test as they land, for the live views.
+    live_ping: Option<f64>,
+    live_down: Option<f64>,
     err: Option<String>,
     tile_size: TileSize,
     tile_w: f64,
@@ -516,15 +523,31 @@ fn run_test(tx: mpsc::Sender<Msg>) {
     let ag = agent();
     let stop = Arc::new(AtomicBool::new(false));
     let r = (|| -> Result<Run, String> {
-        let _ = tx.send(Msg::Phase("Ping", 0.05));
+        let _ = tx.send(Msg::Phase("Ping", 0.05, None, None));
         let p = ping(&ag)?;
-        let _ = tx.send(Msg::Phase("Download", 0.2));
+        let _ = tx.send(Msg::Phase("Download", 0.2, Some(p), None));
         let d = download(&ag, &stop)?;
-        let _ = tx.send(Msg::Phase("Upload", 0.65));
+        let _ = tx.send(Msg::Phase("Upload", 0.65, Some(p), Some(d)));
         let u = upload(&ag, d, &stop)?;
         Ok(Run { down: d, up: u, ping: p })
     })();
     let _ = tx.send(Msg::Done(r));
+}
+
+/// One test at a time: a click while a test runs is ignored. Runs start from
+/// the page's button or header ▶, the 2x2 tile's ▶, or a tap on the tile body.
+fn start_test(st: &mut State, tx: &mpsc::Sender<Msg>) {
+    if st.phase.is_some() {
+        return;
+    }
+    st.phase = Some("Starting");
+    st.err = None;
+    st.live_ping = None;
+    st.live_down = None;
+    send(json!({"type":"active","active":true}));
+    let t = tx.clone();
+    thread::spawn(move || run_test(t));
+    draw(st);
 }
 
 // ---------- storage ----------
@@ -612,17 +635,33 @@ fn tile_view(st: &State) -> Value {
 
     // large (2x2, 104x104): all three numbers and the history
     if st.tile_size == TileSize::Large {
-        let (l1, l2, l3) = match (st.phase, last) {
-            (Some(p), _) => (format!("{p}…"), String::new(), String::new()),
-            (None, Some(r)) => (
-                format!("↓ {} Mbps", fmt(r.down)),
-                format!("↑ {} Mbps", fmt(r.up)),
-                format!("ping {} ms", fmt(r.ping)),
-            ),
-            _ => ("Tap to test".to_string(), String::new(), String::new()),
+        let (l1, l2, l3) = if let Some(p) = st.phase {
+            // a run in progress: each number appears as its phase finishes
+            let d = st
+                .live_down
+                .map(|d| format!("↓ {} Mbps", fmt(d)))
+                .unwrap_or_else(|| "↓ …".to_string());
+            let u = (p == "Upload").then(|| "↑ …".to_string()).unwrap_or_default();
+            let g = st
+                .live_ping
+                .map(|g| format!("ping {} ms", fmt(g)))
+                .unwrap_or_else(|| "ping …".to_string());
+            (d, u, g)
+        } else {
+            match last {
+                Some(r) => (
+                    format!("↓ {} Mbps", fmt(r.down)),
+                    format!("↑ {} Mbps", fmt(r.up)),
+                    format!("ping {} ms", fmt(r.ping)),
+                ),
+                _ => ("Tap to test".to_string(), String::new(), String::new()),
+            }
         };
         let mut kids = vec![
-            json!({"type":"text","text":"Speedtest","size":"small","color":"dim"}),
+            json!({"type":"row","children":[
+                {"type":"text","text":"Speedtest","size":"small","color":"dim"},
+                {"type":"spacer"},
+                {"type":"button","id":"run","icon":"play"}]}),
             json!({"type":"text","text":l1,"size":"body"}),
             json!({"type":"text","text":l2,"size":"body"}),
             json!({"type":"text","text":l3,"size":"small","color":"dim"}),
@@ -635,10 +674,18 @@ fn tile_view(st: &State) -> Value {
     }
 
     // wide (2x1, 104x36): icon and two lines
-    let line = match (st.phase, last) {
-        (Some(p), _) => format!("{p}…"),
-        (None, Some(r)) => format!("↓{} ↑{}", fmt(r.down), fmt(r.up)),
-        _ => "Tap to test".to_string(),
+    let line = if let Some(p) = st.phase {
+        match (p, st.live_down) {
+            ("Ping", _) => "Ping…".to_string(),
+            ("Download", _) => "↓ …".to_string(),
+            ("Upload", Some(d)) => format!("↓{} ↑…", fmt(d)),
+            _ => "…".to_string(),
+        }
+    } else {
+        match last {
+            Some(r) => format!("↓{} ↑{}", fmt(r.down), fmt(r.up)),
+            None => "Tap to test".to_string(),
+        }
     };
     json!({"type":"row","align":"center","gap":8,"children":[
         {"type":"icon","icon":"speedometer","size":22,"color":"accent"},
@@ -652,9 +699,19 @@ fn draw(st: &State) {
     send(json!({"type":"tile","view":tile_view(st)}));
 
     let dash = || "–".to_string();
-    let (d, u, p) = match last {
-        Some(r) => (fmt(r.down), fmt(r.up), fmt(r.ping)),
-        None => (dash(), dash(), dash()),
+    let live = || "…".to_string();
+    let (d, u, p) = if st.phase.is_some() {
+        // live run: each card shows its number the moment its phase ends
+        (
+            st.live_down.map(fmt).unwrap_or_else(live),
+            live(),
+            st.live_ping.map(fmt).unwrap_or_else(live),
+        )
+    } else {
+        match last {
+            Some(r) => (fmt(r.down), fmt(r.up), fmt(r.ping)),
+            None => (dash(), dash(), dash()),
+        }
     };
     let label = if st.phase.is_some() { "Testing…" } else { "Run test" };
     let mut kids = vec![json!({"type":"grid","columns":3,"gap":8,"children":[
@@ -670,7 +727,9 @@ fn draw(st: &State) {
         kids.push(json!({"type":"text","text":e,"color":"red","size":"small"}));
     }
     kids.push(json!({"type":"button","id":"run","label":label,"icon":"play","primary":true,"width":0}));
-    send(json!({"type":"page","view":{"type":"column","gap":8,"scroll":true,"children":kids}}));
+    send(json!({"type":"page",
+        "actions":[{"id":"run","icon":"play","tooltip":"Run test"}],
+        "view":{"type":"column","gap":8,"scroll":true,"children":kids}}));
 }
 
 // ---------- main ----------
@@ -695,6 +754,8 @@ fn main() {
     let mut st = State {
         hist: vec![],
         phase: None,
+        live_ping: None,
+        live_down: None,
         err: None,
         tile_size: TileSize::Wide,
         tile_w: 104.0,
@@ -733,14 +794,12 @@ fn main() {
                     draw(&st);
                 }
                 Some("event") if v["id"] == "run" && v["kind"] == "click" => {
-                    if st.phase.is_none() {
-                        st.phase = Some("Starting");
-                        st.err = None;
-                        send(json!({"type":"active","active":true}));
-                        let t = tx.clone();
-                        thread::spawn(move || run_test(t));
-                        draw(&st);
-                    }
+                    start_test(&mut st, &tx);
+                }
+                Some("tile_click") => {
+                    // A tap on the tile body runs a test; Fenn opens the page
+                    // beside it, which then shows the live numbers too.
+                    start_test(&mut st, &tx);
                 }
                 Some("shutdown") => {
                     save_hist(&st.dir, &st.hist);
@@ -748,13 +807,17 @@ fn main() {
                 }
                 _ => {}
             },
-            Msg::Phase(p, progress) => {
+            Msg::Phase(p, progress, ping, down) => {
                 st.phase = Some(p);
+                st.live_ping = ping;
+                st.live_down = down;
                 send(json!({"type":"badge","badge":{"kind":"ring","progress":progress,"label":&p[..1]}}));
                 draw(&st);
             }
             Msg::Done(r) => {
                 st.phase = None;
+                st.live_ping = None;
+                st.live_down = None;
                 match r {
                     Ok(run) => {
                         st.hist.push(run);
