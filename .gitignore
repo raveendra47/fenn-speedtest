@@ -1,0 +1,5 @@
+# bin/ must be committed: Fenn installs the exact commit the listing was
+# made from, and plugin.toml runs bin/speedtest.exe.
+/target
+__pycache__/
+*.pyc

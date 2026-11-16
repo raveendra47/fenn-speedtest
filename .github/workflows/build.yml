@@ -1,22 +1,30 @@
-name: Build
+name: build
 
 on:
   push:
     branches: [main]
+  pull_request:
   workflow_dispatch:
 
 jobs:
   windows:
+    name: Build Windows binary
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build
-        run: cargo build --release
-      - name: Show checksum
-        run: Get-FileHash target\release\speedtest.exe
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
       - uses: actions/upload-artifact@v4
         with:
           name: speedtest-windows
-          path: |
-            target/release/speedtest.exe
-            Cargo.lock
+          path: target/release/speedtest.exe
+          if-no-files-found: error
+
+  tests:
+    name: Protocol and mock-server tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - run: python3 tests/fake_fenn.py target/release/speedtest

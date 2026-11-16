@@ -1,0 +1,7 @@
+GET 25MB plain (control, expect 429)         -> 200 25000000 0.404378
+GET 25MB Origin: speed.cloudflare.com        -> 200 25000000 0.375593
+GET 25MB Origin: example.com                 -> 200 25000000 0.335619
+GET 25MB Referer: speed.cloudflare.com       -> 200 25000000 0.372753
+POST 25MB plain (__up budget?)               -> 200 0 0.442657
+HEAD 250MB + Origin (size gate)              -> 200 0 0.058296
+DONE
