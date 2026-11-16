@@ -40,6 +40,15 @@ fn send(v: Value) {
 
 // ---------- test ----------
 
+fn http_err(e: ureq::Error) -> String {
+    match e {
+        ureq::Error::Status(429, _) => {
+            "Cloudflare is limiting requests. Wait a few minutes and try again.".to_string()
+        }
+        other => other.to_string(),
+    }
+}
+
 fn agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(10))
@@ -53,7 +62,7 @@ fn ping(ag: &ureq::Agent) -> Result<f64, String> {
         let mut sink = Vec::new();
         ag.get(&url)
             .call()
-            .map_err(|e| e.to_string())?
+            .map_err(http_err)?
             .into_reader()
             .read_to_end(&mut sink)
             .map_err(|e| e.to_string())?;
@@ -74,7 +83,7 @@ fn mbps(bytes: u64, secs: f64) -> f64 {
 }
 
 fn download(ag: &ureq::Agent) -> Result<f64, String> {
-    let url = format!("{DOWN}25000000");
+    let url = format!("{DOWN}100000000");
     let start = Instant::now();
     let end = start + Duration::from_secs(TEST_SECS);
     let total: Result<u64, String> = thread::scope(|s| {
@@ -84,7 +93,7 @@ fn download(ag: &ureq::Agent) -> Result<f64, String> {
                     let mut n = 0u64;
                     let mut buf = [0u8; 65536];
                     while Instant::now() < end {
-                        let mut r = ag.get(&url).call().map_err(|e| e.to_string())?.into_reader();
+                        let mut r = ag.get(&url).call().map_err(http_err)?.into_reader();
                         loop {
                             let k = r.read(&mut buf).map_err(|e| e.to_string())?;
                             if k == 0 {
@@ -108,7 +117,7 @@ fn download(ag: &ureq::Agent) -> Result<f64, String> {
 }
 
 fn upload(ag: &ureq::Agent) -> Result<f64, String> {
-    let body = vec![0u8; 5_000_000];
+    let body = vec![0u8; 10_000_000];
     let start = Instant::now();
     let end = start + Duration::from_secs(TEST_SECS);
     let total: Result<u64, String> = thread::scope(|s| {
@@ -120,7 +129,7 @@ fn upload(ag: &ureq::Agent) -> Result<f64, String> {
                         ag.post(UP)
                             .set("Content-Type", "application/octet-stream")
                             .send_bytes(&body)
-                            .map_err(|e| e.to_string())?;
+                            .map_err(http_err)?;
                         n += body.len() as u64;
                     }
                     Ok(n)
@@ -331,7 +340,10 @@ fn main() {
                         }
                         save(&st.hist);
                     }
-                    Err(e) => st.err = Some(e),
+                    Err(e) => {
+                        eprintln!("speedtest failed: {e}");
+                        st.err = Some(e);
+                    }
                 }
                 send(json!({"type":"badge","badge":null}));
                 send(json!({"type":"active","active":false}));
