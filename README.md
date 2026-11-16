@@ -14,9 +14,9 @@ The source code is in `src/main.rs`. To build it yourself: `cargo build --releas
 ## How it measures
 
 - **Ping** — five timed empty requests; the median round trip minus the processing time Cloudflare itself reports in the `Server-Timing` header.
-- **Download** — six parallel streams, starting a quarter second apart (a same-instant burst of large requests draws rate-limit 429s). Each stream warms up until its connection has ramped (two seconds at most), then counts bytes for up to eight seconds. Chunks are as large as Cloudflare will serve a plain client (probed with HEAD requests before the first test), and a test moves at most 300 MB, so a fast line needs only a handful of requests and stays inside Cloudflare's per-IP byte budget.
+- **Download** — six parallel streams, starting a quarter second apart (a same-instant burst of large requests draws rate-limit 429s). Each stream warms up until its connection has ramped (two seconds at most), then counts bytes for up to eight seconds. Each stream starts with a 10 MB chunk, doubles it while requests finish in under a second (up to 100 MB) and halves it when they crawl, like the browser test does; a test moves at most 300 MB, so a fast line needs only a handful of requests and stays inside Cloudflare's per-IP byte budget.
 - **Upload** — six parallel streams. The warm-up ramps the connections and sizes the request bodies (about two seconds of data each, 250 KB to 100 MB — short enough that every stream finishes a request inside the 500 MB budget); the counted phase then runs up to eight seconds. A stream's rate is the bytes of its finished requests over their duration, so a request still in flight when the clock runs out cannot skew the number; the result is the sum of the stream rates.
-- If Cloudflare answers 429 (rate limit) or 403 (size refused), the test stops cleanly with a message instead of hammering the endpoint. A 429 means the per-IP download budget is spent — wait a few minutes and try again.
+- If Cloudflare answers 429, every stream stops at once — hammering a limited endpoint would only make the limit worse. Whatever was already measured still counts: the run finishes with a partial result and an orange note saying why. Only a 429 before anything was measured fails the run with a message. A 429 means the per-IP byte budget is spent — running tests back to back spends it (it refills over a few minutes); wait and try again. A 403 (chunk size refused) just makes the streams ask for smaller chunks.
 
 ## What it sends, and where
 
@@ -31,11 +31,11 @@ The source code is in `src/main.rs`. To build it yourself: `cargo build --releas
 
 ## Accuracy
 
-The method matches the engine behind [speed.cloudflare.com](https://speed.cloudflare.com) (same endpoints; six parallel streams instead of its sequential size ramp). Expect numbers in the same range as that test run at the same moment; any speed test can differ from another by 10–15% depending on which server it picks and when. Ping here is an HTTP round trip with Cloudflare's own processing time subtracted, so it reads a few ms higher than an ICMP ping.
+The method matches the engine behind [speed.cloudflare.com](https://speed.cloudflare.com) (same endpoints; six parallel streams with adaptive chunk sizes instead of its sequential ramp). Expect numbers in the same range as that test run at the same moment; any speed test can differ from another by 10–15% depending on which server it picks and when. Ping here is an HTTP round trip with Cloudflare's own processing time subtracted, so it reads a few ms higher than an ICMP ping.
 
 ## Development
 
-`tests/fake_fenn.py` is a fake Fenn plus a mock speed-test server. It checks the protocol (tile at all three sizes, layout persistence across restarts), a full run, a run started from the tile (its ▶ button and a tap on the tile body, with the live numbers on the tile), a 429 abort, the size-probe fallback and an unreachable server — all without touching the network:
+`tests/fake_fenn.py` is a fake Fenn plus a mock speed-test server. It checks the protocol (tile at all three sizes, layout persistence across restarts), a full run, a run started from the tile (its ▶ button and a tap on the tile body, with the live numbers on the tile), a 429 abort, a mid-run 429 that keeps its partial result, the adaptive chunk sizing on 403 and an unreachable server — all without touching the network:
 
 ```
 cargo build --release

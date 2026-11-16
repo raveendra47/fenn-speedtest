@@ -9,17 +9,21 @@
 // - download: six parallel streams, started a quarter second apart (a burst
 //   of same-instant large GETs draws 429s). Each stream warms up until its
 //   connection has ramped (at most two seconds), then counts bytes for up to
-//   eight seconds. Chunks are as large as Cloudflare will serve a plain
-//   client (probed with HEAD requests), and a test moves at most 300 MB so
-//   fast lines stay inside Cloudflare's per-IP byte budget.
+//   eight seconds. Each stream starts with a 10 MB chunk, doubles it while
+//   requests finish in under a second (up to 100 MB) and halves it when they
+//   crawl; a test moves at most 300 MB so fast lines stay inside Cloudflare's
+//   per-IP byte budget.
 // - upload: six parallel streams, two seconds of warm-up (which also sizes
 //   the request bodies to about four seconds of data each), then eight
 //   seconds counted, at most 500 MB. A stream's rate is the bytes of its
 //   finished requests over their total duration, so a request still in
 //   flight when the clock runs out cannot skew the number; the test's rate
 //   is the sum of the stream rates.
-// - a 429 (rate limit) or a 403 (size refused) stops the whole test cleanly;
-//   hammering a limited endpoint would only make the limit worse.
+// - a 429 stops every stream at once (hammering a limited endpoint would only
+//   make the limit worse); what was already measured still counts, shown with
+//   a warning rather than failing the run. A 429 before anything was measured
+//   fails the run. A 403 (chunk size refused) makes the streams ask for
+//   smaller chunks and carry on.
 
 use serde_json::{json, Value};
 use std::io::{BufRead, Read, Write};
@@ -32,10 +36,12 @@ use std::{env, fs, thread};
 const STREAMS: usize = 6;
 const KEEP: usize = 20;
 const PING_COUNT: usize = 5;
-/// __down chunk ladder, probed with HEAD requests (no data moves). The first
-/// size Cloudflare serves to a plain client wins; 25 MB always worked.
-const DOWN_LADDER: [u64; 2] = [50_000_000, 25_000_000];
-const DOWN_FALLBACK: u64 = 25_000_000;
+/// Download chunk sizes adapt per stream, like the browser test's: start at
+/// 10 MB, double while a request finishes in under a second, halve when one
+/// takes seconds. Asking for the maximum size right away draws rate-limit 429s.
+const DOWN_START: u64 = 10_000_000;
+const DOWN_MAX: u64 = 100_000_000;
+const DOWN_MIN: u64 = 5_000_000;
 /// Per-test budgets. Cloudflare meters __down body bytes per IP (a burst of
 /// 450 MB had requests refused while ~300 MB went through), so a test moves
 /// at most DOWN_CAP down. __up was never seen limited but is bounded too.
@@ -99,11 +105,14 @@ fn note(msg: String) {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Run {
     down: f64,
     up: f64,
     ping: f64,
+    /// Set when Cloudflare cut a phase short with a 429: the partial result
+    /// is kept and this is shown next to it. Not stored in history.json.
+    warn: Option<String>,
 }
 
 enum Msg {
@@ -151,6 +160,8 @@ struct State {
     live_ping: Option<f64>,
     live_down: Option<f64>,
     err: Option<String>,
+    /// A phase was cut short by a 429; its partial result was kept.
+    warn: Option<String>,
     tile_size: TileSize,
     tile_w: f64,
     tile_h: f64,
@@ -234,30 +245,9 @@ fn ping(ag: &ureq::Agent) -> Result<f64, String> {
     Ok(xs[xs.len() / 2]) // median: one slow outlier must not move the number
 }
 
-/// Largest __down chunk Cloudflare will serve a plain client, probed with
-/// HEAD (no body moves) and cached for the process lifetime.
-static DOWN_CHUNK: AtomicU64 = AtomicU64::new(0);
-
-fn down_chunk(ag: &ureq::Agent) -> u64 {
-    let cached = DOWN_CHUNK.load(Ordering::Relaxed);
-    if cached != 0 {
-        return cached;
-    }
-    let url = down_url();
-    for &size in DOWN_LADDER.iter() {
-        note(format!("probe HEAD bytes={size}"));
-        match ag.request("HEAD", &format!("{url}{size}")).call() {
-            Ok(_) => {
-                note(format!("probe: using {size}-byte chunks"));
-                DOWN_CHUNK.store(size, Ordering::Relaxed);
-                return size;
-            }
-            Err(e) if is_size_refused(&e) => continue, // too big, try smaller
-            Err(_) => break, // limited or unreachable: fall back, don't push
-        }
-    }
-    DOWN_FALLBACK
-}
+/// A phase's measured Mbps, plus the warning to show when Cloudflare cut it
+/// short with a 429 mid-phase (the partial result is kept, not failed).
+type PhaseResult = Result<(f64, Option<String>), String>;
 
 /// One download stream's outcome: (counted bytes, seconds while counting,
 /// last error). Counted bytes over their own span is the stream's rate; the
@@ -274,7 +264,7 @@ fn span_secs(first: Option<Instant>, last: Option<Instant>) -> f64 {
 
 fn stream_down(
     ag: &ureq::Agent,
-    url: &str,
+    base: &str, // "...__down?bytes=" — the chunk size is appended per request
     idx: usize,
     warm_end: Instant,
     end: Instant,
@@ -288,6 +278,8 @@ fn stream_down(
     let mut last_count = None;
     let mut last_err = None;
     let mut buf = [0u8; 65536];
+    let mut size = DOWN_START;
+    let mut max_size = DOWN_MAX; // lowered when a size is refused (403)
     if idx > 0 {
         thread::sleep(Duration::from_millis(STAGGER_MS * idx as u64));
     }
@@ -295,15 +287,28 @@ fn stream_down(
         if stop.load(Ordering::Relaxed) || budget.load(Ordering::Relaxed) >= cap {
             break;
         }
-        let mut r = match ag.get(url).call() {
+        let t0 = Instant::now();
+        let url = format!("{base}{size}");
+        let mut r = match ag.get(&url).call() {
             Ok(r) => r.into_reader(),
             Err(e) => {
-                let fatal = is_limited(&e) || is_size_refused(&e);
-                let msg = http_err(e);
-                if fatal {
+                if is_limited(&e) {
+                    // the per-IP byte budget is spent: stop every stream at once
                     stop.store(true, Ordering::Relaxed);
-                    return (counted, span_secs(first_count, last_count), Some(msg));
+                    return (counted, span_secs(first_count, last_count), Some(http_err(e)));
                 }
+                if is_size_refused(&e) {
+                    if size <= DOWN_MIN {
+                        // even the smallest chunk is refused: endpoint changed
+                        stop.store(true, Ordering::Relaxed);
+                        return (counted, span_secs(first_count, last_count), Some(http_err(e)));
+                    }
+                    max_size = (size / 2).max(DOWN_MIN);
+                    size = max_size;
+                    note(format!("chunk refused, shrinking to {size}"));
+                    continue;
+                }
+                let msg = http_err(e);
                 eprintln!("stream error: {msg}");
                 last_err = Some(msg);
                 continue; // one failed request is not a failed stream
@@ -333,6 +338,15 @@ fn stream_down(
                     break;
                 }
             }
+        }
+        // adapt the chunk size to how fast that request came back
+        let took = t0.elapsed();
+        if took < Duration::from_millis(800) && size < max_size {
+            size = (size * 2).min(max_size);
+            note(format!("chunk grows to {size}"));
+        } else if took > Duration::from_millis(3000) && size > DOWN_MIN {
+            size = (size / 2).max(DOWN_MIN);
+            note(format!("chunk shrinks to {size}"));
         }
     }
     (counted, span_secs(first_count, last_count), last_err)
@@ -395,10 +409,11 @@ fn stream_up(
     (samples, last_err)
 }
 
-fn download(ag: &ureq::Agent, stop: &AtomicBool) -> Result<f64, String> {
-    let chunk = down_chunk(ag);
-    let url = format!("{}{chunk}", down_url());
-    let url: &str = &url;
+fn download(ag: &ureq::Agent) -> PhaseResult {
+    let base = down_url();
+    let base: &str = &base;
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop = &stop;
     let start = Instant::now();
     let warm_end = start + Duration::from_secs_f64(warmup_secs());
     let end = start + Duration::from_secs_f64(warmup_secs() + measure_secs());
@@ -407,7 +422,7 @@ fn download(ag: &ureq::Agent, stop: &AtomicBool) -> Result<f64, String> {
     let budget = &budget;
     let results: Vec<DownResult> = thread::scope(|s| {
         let hs: Vec<_> = (0..STREAMS)
-            .map(|i| s.spawn(move || stream_down(ag, url, i, warm_end, end, budget, cap, stop)))
+            .map(|i| s.spawn(move || stream_down(ag, base, i, warm_end, end, budget, cap, stop)))
             .collect();
         hs.into_iter()
             .map(|h| h.join().unwrap_or((0, 0.0, Some("download thread crashed".to_string()))))
@@ -420,24 +435,24 @@ fn download(ag: &ureq::Agent, stop: &AtomicBool) -> Result<f64, String> {
         rate * 8.0 / 1e6,
         budget.load(Ordering::Relaxed)
     ));
-    // The size cap changed under us; re-probe on the next test.
-    if results
-        .iter()
-        .any(|r| r.2.as_deref().map_or(false, |m| m.starts_with("Cloudflare refused")))
-    {
-        DOWN_CHUNK.store(0, Ordering::Relaxed);
+    if bytes == 0 {
+        // nothing was measured: the honest answer is the error itself
+        return Err(results
+            .iter()
+            .find_map(|r| r.2.clone())
+            .unwrap_or_else(|| "no data received".to_string()));
     }
     if stop.load(Ordering::Relaxed) {
-        return Err(results.iter().find_map(|r| r.2.clone()).unwrap_or_else(|| "aborted".to_string()));
+        // limited mid-phase: keep the partial measurement, with the reason
+        return Ok((rate * 8.0 / 1e6, results.iter().find_map(|r| r.2.clone())));
     }
-    if bytes == 0 {
-        return Err(results.iter().find_map(|r| r.2.clone()).unwrap_or_else(|| "no data received".to_string()));
-    }
-    Ok(rate * 8.0 / 1e6)
+    Ok((rate * 8.0 / 1e6, None))
 }
 
-fn upload(ag: &ureq::Agent, down_mbps: f64, stop: &AtomicBool) -> Result<f64, String> {
+fn upload(ag: &ureq::Agent, down_mbps: f64) -> PhaseResult {
     let url = up_url();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop = &stop;
     let start = Instant::now();
     let warm_end = start + Duration::from_secs_f64(warmup_secs());
     let end = warm_end + Duration::from_secs_f64(measure_secs());
@@ -505,9 +520,6 @@ fn upload(ag: &ureq::Agent, down_mbps: f64, stop: &AtomicBool) -> Result<f64, St
         rate * 8.0 / 1e6,
         budget.load(Ordering::Relaxed)
     ));
-    if stop.load(Ordering::Relaxed) {
-        return Err(results.iter().find_map(|r| r.1.clone()).unwrap_or_else(|| "aborted".to_string()));
-    }
     if bytes == 0 {
         return Err(
             results
@@ -516,20 +528,26 @@ fn upload(ag: &ureq::Agent, down_mbps: f64, stop: &AtomicBool) -> Result<f64, St
                 .unwrap_or_else(|| "no data uploaded".to_string()),
         );
     }
-    Ok(rate * 8.0 / 1e6)
+    if stop.load(Ordering::Relaxed) {
+        // limited mid-phase: keep the partial measurement, with the reason
+        return Ok((rate * 8.0 / 1e6, results.iter().find_map(|r| r.1.clone())));
+    }
+    Ok((rate * 8.0 / 1e6, None))
 }
 
 fn run_test(tx: mpsc::Sender<Msg>) {
     let ag = agent();
-    let stop = Arc::new(AtomicBool::new(false));
     let r = (|| -> Result<Run, String> {
         let _ = tx.send(Msg::Phase("Ping", 0.05, None, None));
         let p = ping(&ag)?;
+        let mut warn = None;
         let _ = tx.send(Msg::Phase("Download", 0.2, Some(p), None));
-        let d = download(&ag, &stop)?;
+        let (d, w) = download(&ag)?;
+        warn = warn.or(w);
         let _ = tx.send(Msg::Phase("Upload", 0.65, Some(p), Some(d)));
-        let u = upload(&ag, d, &stop)?;
-        Ok(Run { down: d, up: u, ping: p })
+        let (u, w) = upload(&ag, d)?;
+        warn = warn.or(w);
+        Ok(Run { down: d, up: u, ping: p, warn })
     })();
     let _ = tx.send(Msg::Done(r));
 }
@@ -542,6 +560,7 @@ fn start_test(st: &mut State, tx: &mpsc::Sender<Msg>) {
     }
     st.phase = Some("Starting");
     st.err = None;
+    st.warn = None;
     st.live_ping = None;
     st.live_down = None;
     send(json!({"type":"active","active":true}));
@@ -578,7 +597,7 @@ fn load_hist(dir: &PathBuf) -> Vec<Run> {
     let Ok(Value::Array(a)) = serde_json::from_str::<Value>(&s) else { return vec![] };
     a.iter()
         .filter_map(|v| {
-            Some(Run { down: v[0].as_f64()?, up: v[1].as_f64()?, ping: v[2].as_f64()? })
+            Some(Run { down: v[0].as_f64()?, up: v[1].as_f64()?, ping: v[2].as_f64()?, warn: None })
         })
         .collect()
 }
@@ -723,6 +742,9 @@ fn draw(st: &State) {
         kids.push(json!({"type":"text","text":"Download history","size":"small","color":"dim"}));
         kids.push(json!({"type":"sparkline","values":vals,"height":80}));
     }
+    if let Some(w) = &st.warn {
+        kids.push(json!({"type":"text","text":w,"color":"orange","size":"small"}));
+    }
     if let Some(e) = &st.err {
         kids.push(json!({"type":"text","text":e,"color":"red","size":"small"}));
     }
@@ -757,6 +779,7 @@ fn main() {
         live_ping: None,
         live_down: None,
         err: None,
+        warn: None,
         tile_size: TileSize::Wide,
         tile_w: 104.0,
         tile_h: 36.0,
@@ -820,6 +843,7 @@ fn main() {
                 st.live_down = None;
                 match r {
                     Ok(run) => {
+                        st.warn = run.warn.clone();
                         st.hist.push(run);
                         if st.hist.len() > KEEP {
                             st.hist.remove(0);

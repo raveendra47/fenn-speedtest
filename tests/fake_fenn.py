@@ -2,8 +2,9 @@
 """Fake Fenn: tests the speedtest plugin without Fenn.
 
 Covers the protocol (tile at all three sizes, layout persistence across a
-restart), a full run against a local mock server, a 429 abort, the size-probe
-fallback on 403, and an unreachable server. No traffic leaves the loopback
+restart), a full run against a local mock server, a run started from the tile,
+a 429 abort, a mid-run 429 whose partial result is kept, the adaptive chunk
+sizing on 403, and an unreachable server. No traffic leaves the loopback
 interface -- the mock server stands in for speed.cloudflare.com.
 
 Usage:
@@ -407,9 +408,45 @@ def t_rate_limited(tmp):
     srv.shutdown()
 
 
+def t_partial_limited(tmp):
+    print("a mid-run 429 keeps the partial result, with a warning")
+    # 6 pings plus three 10/20/40 MB chunks pass; the fourth download request
+    # 429s well before the 300 MB byte budget can end the phase
+    reset_mock(limit_after=9)
+    srv = mock_server()
+    p = Plugin(tmp, env={"SPEEDTEST_BASE_URL": f"http://127.0.0.1:{srv.server_address[1]}",
+                         "SPEEDTEST_SECS": "1.5", "SPEEDTEST_WARMUP_SECS": "0.3"})
+    hello(p, tmp)
+    p.wait_for(lambda m: m.get("type") == "page", "page")
+    p.send({"type": "event", "id": "run", "kind": "click"})
+
+    warn, finished = None, False
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline and not finished:
+        try:
+            m = p.next_msg(5)
+        except queue.Empty:
+            continue  # phases run quiet; the deadline is the real timeout
+        if m.get("type") == "page":
+            warn = next((n.get("text") for n in find_all(m["view"], "text")
+                         if n.get("color") == "orange"), warn)
+            btn = next((c for c in m["view"].get("children", []) if c.get("id") == "run"), None)
+            if warn and btn and btn.get("label") == "Run test":
+                finished = True
+    check(finished and warn is not None and "limiting" in warn,
+          f"the page shows a rate-limit warning next to the result (got: {warn!r})")
+    hist = json.load(open(os.path.join(tmp, "history.json")))
+    d, u, pg = hist[0]
+    check(d > 0, f"the partial download was kept: {d:.0f} Mbps")
+    check(u > 0, f"upload still ran after the download was cut short: {u:.0f} Mbps")
+    check(pg > 0, "ping was measured before the limit hit")
+    check(p.shutdown() == 0, "shutdown exits cleanly")
+    srv.shutdown()
+
+
 def t_size_fallback(tmp):
-    print("403 makes the probe fall back to a smaller chunk")
-    reset_mock(cap=40_000_000)  # refuses the 50 MB rung
+    print("403 makes the streams shrink their chunk size")
+    reset_mock(cap=12_000_000)  # refuses any chunk above 12 MB
     srv = mock_server()
     p = Plugin(tmp, env={"SPEEDTEST_BASE_URL": f"http://127.0.0.1:{srv.server_address[1]}",
                          "SPEEDTEST_SECS": "0.6", "SPEEDTEST_WARMUP_SECS": "0.3"})
@@ -422,11 +459,11 @@ def t_size_fallback(tmp):
         m = p.next_msg(5)
         if m.get("type") == "active" and m.get("active") is False:
             break
+    gets = [n for meth, n in MockState.log if meth == "GET" and n > 0]
     heads = [n for meth, n in MockState.log if meth == "HEAD"]
-    gets = [n for meth, n in MockState.log if meth == "GET"]
-    check(50_000_000 in heads, "probe tried the 50 MB rung")
-    check(25_000_000 in heads, "probe fell back to the 25 MB rung")
-    check(gets and max(gets) == 25_000_000, "download ran with 25 MB chunks")
+    check(not heads, "no HEAD probing: chunk sizes adapt from real responses")
+    check(20_000_000 in gets, "a fast first chunk doubled to 20 MB and was refused")
+    check(set(gets) <= {10_000_000, 20_000_000}, "streams settled on 10 MB chunks")
     check(os.path.exists(os.path.join(tmp, "history.json")), "the run still succeeded")
     check(p.shutdown() == 0, "shutdown exits cleanly")
     srv.shutdown()
@@ -507,8 +544,8 @@ def live():
     err = p.proc.stderr.read()
     counts = {}
     for line in err.splitlines():
-        if line.startswith("probe HEAD"):
-            counts["probe HEAD"] = counts.get("probe HEAD", 0) + 1
+        if line.startswith("chunk"):
+            counts["chunk resize"] = counts.get("chunk resize", 0) + 1
         elif line.startswith("up "):
             counts["upload POST"] = counts.get("upload POST", 0) + 1
     downloads = sum(1 for line in err.splitlines() if line.startswith("download:"))
@@ -530,6 +567,7 @@ def main():
         t_success,
         t_tile_run,
         t_rate_limited,
+        t_partial_limited,
         t_size_fallback,
         t_byte_cap,
         t_unreachable,
