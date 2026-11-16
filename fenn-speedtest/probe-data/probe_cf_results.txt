@@ -1,0 +1,60 @@
+== A. line speed: GET 25 MB ==
+GET 25MB: code=200 bytes=25000000 t=0.30s ~667 Mbps
+== B. response headers of GET bytes=0 ==
+code=200
+HTTP/1.1 200 OK
+Date: Mon, 16 Nov 2026 07:08:50 GMT
+Content-Type: application/octet-stream
+Content-Length: 0
+Connection: keep-alive
+Access-Control-Allow-Origin: *
+Cache-Control: no-store, no-transform
+Vary: Origin
+access-control-expose-headers: server-timing, content-length, cf-meta-ip, cf-meta-request-time, cf-meta-colo, cf-meta-asn, cf-meta-country, cf-meta-city, cf-meta-postalCode, cf-meta-latitude, cf-meta-longitude, cf-meta-timezone
+asn: 45102
+cf-meta-ip: 47.57.242.119
+cf-meta-request-time: 1794812930396
+city: Hong Kong
+colo: HKG
+country: HK
+latitude: 22.27832
+longitude: 114.17469
+postalCode: 999077
+timezone: Asia/Hong_Kong
+timing-allow-origin: *
+Report-To: {"group":"cf-nel","max_age":604800,"endpoints":[{"url":"https://a.nel.cloudflare.com/report/v4?s=d9xWZMXSDFvdec1%2FqskoXWXMfHbaj4ljyhogjxrzzSS21jA6qtnA0VHIu5h4swGf4cyeAW594p%2BdG9ZxrNMuhLCqdIbbdNP6vZ4pABhVdOQpH6VAMrWUyxRoPpWI5QxsbbPa2rIc"}]}
+Nel: {"report_to":"cf-nel","success_fraction":0.01,"max_age":604800}
+Server-Timing: cfSpeedEdge;dur=43, cfSpeedWorker;dur=38
+Server: cloudflare
+CF-RAY: a5b4aaaebe70e2f5-HKG
+server-timing: cfL4;desc="?proto=TCP&rtt=4772&min_rtt=4321&rtt_var=1943&sent=5&recv=7&lost=0&retrans=0&sent_bytes=3946&recv_bytes=1780&delivery_rate=970608&cwnd=53&unsent_bytes=0&cid=f2973e53de6f16a8&ts=91&x=0"
+
+
+== C. __down size ladder (HEAD, 2s apart) ==
+HEAD bytes= 25000000: 200
+HEAD bytes= 26214400: 200
+HEAD bytes= 30000000: 200
+HEAD bytes= 35000000: 200
+HEAD bytes= 40000000: 200
+HEAD bytes= 50000000: 200
+HEAD bytes= 60000000: 200
+HEAD bytes= 64000000: 200
+HEAD bytes= 75000000: 200
+HEAD bytes= 80000000: 200
+HEAD bytes= 90000000: 200
+HEAD bytes=100000000: 403
+HEAD bytes=104857600: 403
+HEAD bytes=150000000: 403
+HEAD bytes=209715200: 403
+HEAD bytes=262144000: 403
+down_max (HEAD-accepted) = 90000000
+== D. GET confirm of down_max (downloads it once) ==
+GET 90000000: code=200 bytes=90000000 t=1.22s ~588 Mbps
+== E. __up POST ladder (real uploads, 5s apart) ==
+POST   1000000 bytes: 200 t=0.22s ~37 Mbps up
+POST  25000000 bytes: 200 t=0.29s ~683 Mbps up
+POST  50000000 bytes: 200 t=1.40s ~285 Mbps up
+POST 100000000 bytes: 200 t=1.87s ~427 Mbps up
+POST 104857600 bytes: 200 t=1.95s
+POST 150000000 bytes: 200 t=3.26s
+DONE. summary -> probe_cf_summary.json
