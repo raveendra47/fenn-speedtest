@@ -115,11 +115,11 @@ fn format_wait(secs: u64) -> String {
     }
 }
 
-fn rate_limit_wait(e: &ureq::Error) -> Option<u64> {
+fn rate_limit_wait(e: &ureq::Error) -> Option<i64> {
     match e {
         ureq::Error::Status(429, r) => Some(
             r.header("retry-after")
-                .and_then(|v| v.trim().parse::<u64>().ok())
+                .and_then(|v| v.trim().parse::<i64>().ok())
                 .map(|s| s.min(120))
                 .unwrap_or(180),
         ),
@@ -239,12 +239,12 @@ fn http_err(e: ureq::Error) -> String {
         ureq::Error::Status(429, r) => {
             let wait = r
                 .header("retry-after")
-                .and_then(|v| v.trim().parse::<u64>().ok())
+                .and_then(|v| v.trim().parse::<i64>().ok())
                 .map(|s| s.min(120))
                 .unwrap_or(180);
             format!(
                 "Cloudflare is limiting requests. Try again in {}.",
-                format_wait(wait)
+                format_wait(wait as u64)
             )
         }
         ureq::Error::Status(403, _) => {
