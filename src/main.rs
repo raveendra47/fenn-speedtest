@@ -30,7 +30,7 @@ use std::io::{BufRead, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{env, fs, thread};
 
 const STREAMS: usize = 6;
@@ -98,6 +98,43 @@ fn base_url() -> String {
     env::var("SPEEDTEST_BASE_URL").unwrap_or_else(|_| "https://speed.cloudflare.com".to_string())
 }
 
+fn now_unix() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+fn format_wait(secs: u64) -> String {
+    let mins = secs / 60;
+    let secs = secs % 60;
+    if mins > 0 {
+        format!("about {}m {}s", mins, secs)
+    } else {
+        format!("about {}s", secs)
+    }
+}
+
+fn rate_limit_wait(e: &ureq::Error) -> Option<u64> {
+    match e {
+        ureq::Error::Status(429, r) => Some(
+            r.header("retry-after")
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .map(|s| s.min(120))
+                .unwrap_or(180),
+        ),
+        _ => None,
+    }
+}
+
+fn cooldown_message(until: i64) -> String {
+    let remaining = (until.saturating_sub(now_unix()) as u64).max(1);
+    format!(
+        "Cloudflare is limiting requests. Try again in {}.",
+        format_wait(remaining)
+    )
+}
+
 fn note(msg: String) {
     static ON: OnceLock<bool> = OnceLock::new();
     if *ON.get_or_init(|| env::var("SPEEDTEST_VERBOSE").is_ok()) {
@@ -113,6 +150,8 @@ struct Run {
     /// Set when Cloudflare cut a phase short with a 429: the partial result
     /// is kept and this is shown next to it. Not stored in history.json.
     warn: Option<String>,
+    /// Unix timestamp after which the user may try again.
+    cooldown_until: Option<i64>,
 }
 
 enum Msg {
@@ -162,6 +201,8 @@ struct State {
     err: Option<String>,
     /// A phase was cut short by a 429; its partial result was kept.
     warn: Option<String>,
+    /// Cloudflare cooldown; block any new test until this time.
+    cooldown_until: Option<i64>,
     tile_size: TileSize,
     tile_w: f64,
     tile_h: f64,
@@ -196,15 +237,15 @@ fn is_size_refused(e: &ureq::Error) -> bool {
 fn http_err(e: ureq::Error) -> String {
     match e {
         ureq::Error::Status(429, r) => {
-            // The header overstates the wait in practice: full requests go
-            // through again within minutes. Only quote it when it is short.
             let wait = r
                 .header("retry-after")
                 .and_then(|v| v.trim().parse::<u64>().ok())
-                .filter(|s| *s <= 120)
-                .map(|s| format!("{s} seconds"))
-                .unwrap_or_else(|| "a few minutes".to_string());
-            format!("Cloudflare is limiting requests. Wait {wait} and try again.")
+                .map(|s| s.min(120))
+                .unwrap_or(180);
+            format!(
+                "Cloudflare is limiting requests. Try again in {}.",
+                format_wait(wait)
+            )
         }
         ureq::Error::Status(403, _) => {
             "Cloudflare refused the request size (403). The endpoint may have changed.".to_string()
@@ -247,13 +288,13 @@ fn ping(ag: &ureq::Agent) -> Result<f64, String> {
 
 /// A phase's measured Mbps, plus the warning to show when Cloudflare cut it
 /// short with a 429 mid-phase (the partial result is kept, not failed).
-type PhaseResult = Result<(f64, Option<String>), String>;
+type PhaseResult = Result<(f64, Option<String>, Option<i64>), String>;
 
 /// One download stream's outcome: (counted bytes, seconds while counting,
 /// last error). Counted bytes over their own span is the stream's rate; the
 /// test's result is the sum of the stream rates, which is the aggregate
 /// throughput of the parallel streams.
-type DownResult = (u64, f64, Option<String>);
+type DownResult = (u64, f64, Option<String>, Option<i64>);
 
 fn span_secs(first: Option<Instant>, last: Option<Instant>) -> f64 {
     match (first, last) {
@@ -295,13 +336,23 @@ fn stream_down(
                 if is_limited(&e) {
                     // the per-IP byte budget is spent: stop every stream at once
                     stop.store(true, Ordering::Relaxed);
-                    return (counted, span_secs(first_count, last_count), Some(http_err(e)));
+                    return (
+                        counted,
+                        span_secs(first_count, last_count),
+                        Some(http_err(e)),
+                        rate_limit_wait(&e),
+                    );
                 }
                 if is_size_refused(&e) {
                     if size <= DOWN_MIN {
                         // even the smallest chunk is refused: endpoint changed
                         stop.store(true, Ordering::Relaxed);
-                        return (counted, span_secs(first_count, last_count), Some(http_err(e)));
+                        return (
+                            counted,
+                            span_secs(first_count, last_count),
+                            Some(http_err(e)),
+                            None,
+                        );
                     }
                     max_size = (size / 2).max(DOWN_MIN);
                     size = max_size;
@@ -349,7 +400,7 @@ fn stream_down(
             note(format!("chunk shrinks to {size}"));
         }
     }
-    (counted, span_secs(first_count, last_count), last_err)
+    (counted, span_secs(first_count, last_count), last_err, None)
 }
 
 /// (bytes, seconds) of one finished upload request.
@@ -368,7 +419,7 @@ fn stream_up(
     wanted: usize,
     wanted_bytes: u64,
     stop: &AtomicBool,
-) -> (Vec<UpSample>, Option<String>) {
+) -> (Vec<UpSample>, Option<String>, Option<i64>) {
     let mut samples = Vec::new();
     let mut own = 0u64;
     let mut last_err = None;
@@ -396,9 +447,10 @@ fn stream_up(
             Err(e) => {
                 let fatal = is_limited(&e) || is_size_refused(&e);
                 let msg = http_err(e);
+                let cooldown = rate_limit_wait(&e);
                 if fatal {
                     stop.store(true, Ordering::Relaxed);
-                    return (samples, Some(msg));
+                    return (samples, Some(msg), cooldown);
                 }
                 eprintln!("stream error: {msg}");
                 last_err = Some(msg);
@@ -406,7 +458,7 @@ fn stream_up(
             }
         }
     }
-    (samples, last_err)
+    (samples, last_err, None)
 }
 
 fn download(ag: &ureq::Agent) -> PhaseResult {
@@ -425,11 +477,12 @@ fn download(ag: &ureq::Agent) -> PhaseResult {
             .map(|i| s.spawn(move || stream_down(ag, base, i, warm_end, end, budget, cap, stop)))
             .collect();
         hs.into_iter()
-            .map(|h| h.join().unwrap_or((0, 0.0, Some("download thread crashed".to_string()))))
+            .map(|h| h.join().unwrap_or((0, 0.0, Some("download thread crashed".to_string()), None)))
             .collect()
     });
     let bytes: u64 = results.iter().map(|r| r.0).sum();
     let rate: f64 = results.iter().filter(|r| r.1 > 0.0).map(|r| r.0 as f64 / r.1).sum();
+    let cooldown = results.iter().filter_map(|r| r.3).max();
     note(format!(
         "download: {bytes} bytes, {:.0} Mbps (budget {}/{cap})",
         rate * 8.0 / 1e6,
@@ -444,9 +497,13 @@ fn download(ag: &ureq::Agent) -> PhaseResult {
     }
     if stop.load(Ordering::Relaxed) {
         // limited mid-phase: keep the partial measurement, with the reason
-        return Ok((rate * 8.0 / 1e6, results.iter().find_map(|r| r.2.clone())));
+        return Ok((
+            rate * 8.0 / 1e6,
+            results.iter().find_map(|r| r.2.clone()),
+            cooldown,
+        ));
     }
-    Ok((rate * 8.0 / 1e6, None))
+    Ok((rate * 8.0 / 1e6, None, cooldown))
 }
 
 fn upload(ag: &ureq::Agent, down_mbps: f64) -> PhaseResult {
@@ -494,18 +551,19 @@ fn upload(ag: &ureq::Agent, down_mbps: f64) -> PhaseResult {
     note(format!("upload bodies: {body_len} bytes"));
 
     let up_body = vec![0u8; body_len as usize];
-    let results: Vec<(Vec<UpSample>, Option<String>)> = thread::scope(|s| {
+    let results: Vec<(Vec<UpSample>, Option<String>, Option<i64>)> = thread::scope(|s| {
         let hs: Vec<_> = (0..STREAMS)
             .map(|_| {
                 s.spawn(|| stream_up(ag, &url, &up_body, end, &budget, cap, usize::MAX, u64::MAX, stop))
             })
             .collect();
         hs.into_iter()
-            .map(|h| h.join().unwrap_or((Vec::new(), Some("upload thread crashed".to_string()))))
+            .map(|h| h.join().unwrap_or((Vec::new(), Some("upload thread crashed".to_string()), None)))
             .collect()
     });
 
     let bytes: u64 = results.iter().flat_map(|r| r.0.iter()).map(|s| s.0).sum();
+    let cooldown = results.iter().filter_map(|r| r.2).max();
     // six parallel streams: the aggregate is the sum of the per-stream rates
     let rate: f64 = results
         .iter()
@@ -530,9 +588,13 @@ fn upload(ag: &ureq::Agent, down_mbps: f64) -> PhaseResult {
     }
     if stop.load(Ordering::Relaxed) {
         // limited mid-phase: keep the partial measurement, with the reason
-        return Ok((rate * 8.0 / 1e6, results.iter().find_map(|r| r.1.clone())));
+        return Ok((
+            rate * 8.0 / 1e6,
+            results.iter().find_map(|r| r.1.clone()),
+            cooldown,
+        ));
     }
-    Ok((rate * 8.0 / 1e6, None))
+    Ok((rate * 8.0 / 1e6, None, cooldown))
 }
 
 fn run_test(tx: mpsc::Sender<Msg>) {
@@ -541,13 +603,29 @@ fn run_test(tx: mpsc::Sender<Msg>) {
         let _ = tx.send(Msg::Phase("Ping", 0.05, None, None));
         let p = ping(&ag)?;
         let mut warn = None;
+        let mut cooldown_until = None;
+
         let _ = tx.send(Msg::Phase("Download", 0.2, Some(p), None));
-        let (d, w) = download(&ag)?;
+        let (d, w, c) = download(&ag)?;
         warn = warn.or(w);
+        cooldown_until = cooldown_until.or(c);
+
         let _ = tx.send(Msg::Phase("Upload", 0.65, Some(p), Some(d)));
-        let (u, w) = upload(&ag, d)?;
+        let (u, w, c) = upload(&ag, d)?;
         warn = warn.or(w);
-        Ok(Run { down: d, up: u, ping: p, warn })
+        cooldown_until = cooldown_until.or(c);
+
+        if let Some(secs) = cooldown_until {
+            cooldown_until = Some(now_unix() + secs as i64);
+        }
+
+        Ok(Run {
+            down: d,
+            up: u,
+            ping: p,
+            warn,
+            cooldown_until,
+        })
     })();
     let _ = tx.send(Msg::Done(r));
 }
@@ -558,6 +636,18 @@ fn start_test(st: &mut State, tx: &mpsc::Sender<Msg>) {
     if st.phase.is_some() {
         return;
     }
+
+    if let Some(until) = st.cooldown_until {
+        if until > now_unix() {
+            st.warn = Some(cooldown_message(until));
+            st.err = None;
+            draw(st);
+            return;
+        }
+        st.cooldown_until = None;
+        clear_cooldown(&st.dir);
+    }
+
     st.phase = Some("Starting");
     st.err = None;
     st.warn = None;
@@ -592,12 +682,36 @@ fn write_atomic(path: PathBuf, contents: String) {
     }
 }
 
+fn load_cooldown(dir: &PathBuf) -> Option<i64> {
+    let Ok(s) = fs::read_to_string(dir.join("cooldown.json")) else {
+        return None;
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&s) else {
+        return None;
+    };
+    v.as_i64()
+}
+
+fn save_cooldown(dir: &PathBuf, until: i64) {
+    write_atomic(dir.join("cooldown.json"), until.to_string());
+}
+
+fn clear_cooldown(dir: &PathBuf) {
+    let _ = fs::remove_file(dir.join("cooldown.json"));
+}
+
 fn load_hist(dir: &PathBuf) -> Vec<Run> {
     let Ok(s) = fs::read_to_string(dir.join("history.json")) else { return vec![] };
     let Ok(Value::Array(a)) = serde_json::from_str::<Value>(&s) else { return vec![] };
     a.iter()
         .filter_map(|v| {
-            Some(Run { down: v[0].as_f64()?, up: v[1].as_f64()?, ping: v[2].as_f64()?, warn: None })
+            Some(Run {
+                down: v[0].as_f64()?,
+                up: v[1].as_f64()?,
+                ping: v[2].as_f64()?,
+                warn: None,
+                cooldown_until: None,
+            })
         })
         .collect()
 }
@@ -742,6 +856,16 @@ fn draw(st: &State) {
         kids.push(json!({"type":"text","text":"Download history","size":"small","color":"dim"}));
         kids.push(json!({"type":"sparkline","values":vals,"height":80}));
     }
+    if let Some(until) = st.cooldown_until {
+        if until > now_unix() {
+            kids.push(json!({
+                "type":"text",
+                "text": cooldown_message(until),
+                "color":"orange",
+                "size":"small"
+            }));
+        }
+    }
     if let Some(w) = &st.warn {
         kids.push(json!({"type":"text","text":w,"color":"orange","size":"small"}));
     }
@@ -780,12 +904,20 @@ fn main() {
         live_down: None,
         err: None,
         warn: None,
+        cooldown_until: None,
         tile_size: TileSize::Wide,
         tile_w: 104.0,
         tile_h: 36.0,
         dir: resolve_dir(None),
     };
     st.hist = load_hist(&st.dir);
+    st.cooldown_until = load_cooldown(&st.dir);
+    if let Some(until) = st.cooldown_until {
+        if until <= now_unix() {
+            st.cooldown_until = None;
+            clear_cooldown(&st.dir);
+        }
+    }
     if let Some((size, w, h)) = load_layout(&st.dir) {
         st.tile_size = size;
         st.tile_w = w;
@@ -799,6 +931,13 @@ fn main() {
                     // hello carries the data dir; reload what we store there.
                     st.dir = resolve_dir(Some(&v));
                     st.hist = load_hist(&st.dir);
+                    st.cooldown_until = load_cooldown(&st.dir);
+                    if let Some(until) = st.cooldown_until {
+                        if until <= now_unix() {
+                            st.cooldown_until = None;
+                            clear_cooldown(&st.dir);
+                        }
+                    }
                     if let Some((size, w, h)) = load_layout(&st.dir) {
                         st.tile_size = size;
                         st.tile_w = w;
@@ -844,6 +983,17 @@ fn main() {
                 match r {
                     Ok(run) => {
                         st.warn = run.warn.clone();
+                        st.cooldown_until = run.cooldown_until;
+                        if let Some(until) = st.cooldown_until {
+                            if until > now_unix() {
+                                save_cooldown(&st.dir, until);
+                            } else {
+                                st.cooldown_until = None;
+                                clear_cooldown(&st.dir);
+                            }
+                        } else {
+                            clear_cooldown(&st.dir);
+                        }
                         st.hist.push(run);
                         if st.hist.len() > KEEP {
                             st.hist.remove(0);
