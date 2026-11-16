@@ -1,0 +1,22 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: cargo build --release
+      - name: Show checksum
+        run: Get-FileHash target\release\speedtest.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: speedtest-windows
+          path: |
+            target/release/speedtest.exe
+            Cargo.lock
