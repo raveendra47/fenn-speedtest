@@ -227,7 +227,7 @@ fn ping(ag: &ureq::Agent) -> Result<f64, String> {
     let round = |warm: bool| -> Result<f64, String> {
         let mut sink = Vec::new();
         let t = Instant::now();
-        let r = ag.get(&url).call().map_err(http_err)?;
+        let r = ag.get(&url).call().map_err(|e| http_err(&e))?;
         let st = server_time(r.header("Server-Timing"));
         r.into_reader().read_to_end(&mut sink).map_err(|e| e.to_string())?;
         note(format!("ping round: {:.1} ms", t.elapsed().as_secs_f64() * 1000.0));
